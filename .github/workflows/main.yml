@@ -1,0 +1,321 @@
+
+name: Pipa Recovery ROM Downloader and Dumper
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: Select ROM region
+        required: true
+        type: choice
+        default: India
+        options:
+          - India
+          - Global
+          - Europe
+          - China
+          - Russia
+          - Taiwan
+          - Indonesia
+          - Turkey
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pipa-rom-dumper
+  cancel-in-progress: false
+
+jobs:
+  dump:
+    name: Download and extract Pipa ROM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      REGION: ${{ inputs.region }}
+      TRACKER: https://raw.githubusercontent.com/XiaomiFirmwareUpdater/miui-updates-tracker/master/rss/pipa.xml
+      DUMPER_COMMIT: 2f0a964b8b77c6244e3e12735f85539c938f9c97
+      SPLIT_SIZE: 1900M
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 p7zip-full
+
+      - name: Configure aria2
+        run: |
+          mkdir -p ~/.aria2
+          cat > ~/.aria2/aria2.conf <<'EOF'
+          continue=true
+          max-concurrent-downloads=1
+          max-connection-per-server=16
+          split=16
+          min-split-size=1M
+          file-allocation=none
+          disk-cache=64M
+          max-tries=10
+          retry-wait=5
+          connect-timeout=30
+          timeout=120
+          check-integrity=true
+          summary-interval=10
+          console-log-level=notice
+          EOF
+
+          aria2c --version
+
+      - name: Find latest stable recovery ROM
+        id: rom
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import html
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from email.utils import parsedate_to_datetime
+
+          url = os.environ["TRACKER"]
+          region = os.environ["REGION"]
+
+          request = urllib.request.Request(
+              url,
+              headers={"User-Agent": "Pipa-ROM-Dumper"}
+          )
+
+          with urllib.request.urlopen(request, timeout=60) as response:
+              root = ET.fromstring(response.read())
+
+          matches = []
+
+          for item in root.findall("./channel/item"):
+              title = item.findtext("title", "")
+              description = html.unescape(
+                  item.findtext("description", "")
+              )
+              download = item.findtext("link", "")
+              published = item.findtext("pubDate", "")
+
+              if f"Recovery update for Xiaomi Pad 6 {region}" not in title:
+                  continue
+
+              if "New Stable Recovery update available" not in description:
+                  continue
+
+              version = re.search(
+                  r"MIUI\s+(.+?)\s+Recovery update",
+                  title
+              )
+
+              md5 = re.search(
+                  r"MD5:</b>\s*([a-fA-F0-9]{32})",
+                  description
+              )
+
+              if not version or not md5:
+                  continue
+
+              if not download.startswith("https://"):
+                  continue
+
+              date = parsedate_to_datetime(published)
+
+              matches.append((
+                  date,
+                  version.group(1).strip(),
+                  download,
+                  md5.group(1).lower()
+              ))
+
+          if not matches:
+              raise SystemExit("No stable recovery ROM found.")
+
+          matches.sort(reverse=True)
+
+          date, version, download, md5 = matches[0]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={version}\n")
+              f.write(f"url={download}\n")
+              f.write(f"md5={md5}\n")
+              f.write(f"published={date.isoformat()}\n")
+
+          print("ROM:", version)
+          print("Download:", download)
+          print("Published:", date.isoformat())
+          PY
+
+      - name: Download ROM using aria2
+        run: |
+          set -euo pipefail
+
+          aria2c \
+            --input-file=/dev/null \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=1M \
+            --file-allocation=none \
+            --continue=true \
+            --max-tries=10 \
+            --retry-wait=5 \
+            --connect-timeout=30 \
+            --timeout=120 \
+            --summary-interval=10 \
+            --check-integrity=true \
+            --out=rom.zip \
+            "${{ steps.rom.outputs.url }}"
+
+          echo "${{ steps.rom.outputs.md5 }}  rom.zip" | md5sum -c -
+
+          7z t rom.zip
+
+      - name: Extract payload.bin
+        run: |
+          set -euo pipefail
+
+          ENTRY=$(7z l -slt rom.zip |
+            sed -n 's/^Path = //p' |
+            grep -E '(^|/)payload.bin$' |
+            head -n 1)
+
+          if [ -z "$ENTRY" ]; then
+            echo "payload.bin not found!"
+            exit 1
+          fi
+
+          7z e -so rom.zip "$ENTRY" > payload.bin
+
+          test -s payload.bin
+
+          rm -f rom.zip
+
+          df -h .
+
+      - name: Install native Python payload dumper
+        run: |
+          set -euo pipefail
+
+          git clone https://github.com/vm03/payload_dumper.git dumper
+
+          git -C dumper checkout "$DUMPER_COMMIT"
+
+          python3 -m venv venv
+
+          venv/bin/pip install --upgrade pip
+
+          venv/bin/pip install -r dumper/requirements.txt
+
+          venv/bin/python dumper/payload_dumper.py --help
+
+      - name: Extract all partition images
+        run: |
+          set -euo pipefail
+
+          mkdir -p release/images
+
+          venv/bin/python dumper/payload_dumper.py \
+            payload.bin \
+            --out release/images
+
+          rm -f payload.bin
+
+          COUNT=$(find release/images -type f -name '*.img' | wc -l)
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No images extracted!"
+            exit 1
+          fi
+
+          echo "Extracted $COUNT partition images."
+
+          df -h .
+
+      - name: Split images larger than 2 GiB
+        run: |
+          set -euo pipefail
+
+          find release/images -type f -name '*.img' -print0 |
+          while IFS= read -r -d '' file; do
+
+            SIZE=$(stat -c '%s' "$file")
+
+            if [ "$SIZE" -gt 2147483648 ]; then
+
+              echo "Splitting $file"
+
+              split \
+                --bytes="$SPLIT_SIZE" \
+                --numeric-suffixes=1 \
+                --suffix-length=3 \
+                "$file" "$file.part"
+
+              rm -f "$file"
+            fi
+
+          done
+
+          find release/images -type f -print0 |
+          while IFS= read -r -d '' file; do
+            SIZE=$(stat -c '%s' "$file")
+
+            if [ "$SIZE" -gt 2147483648 ]; then
+              echo "ERROR: Asset exceeds 2 GiB: $file"
+              exit 1
+            fi
+          done
+
+      - name: Generate checksums and information
+        run: |
+          set -euo pipefail
+
+          cd release
+
+          find images -type f -print0 |
+            sort -z |
+            xargs -0 sha256sum > SHA256SUMS
+
+          {
+            echo "# Xiaomi Pad 6 Pipa Recovery ROM"
+            echo
+            echo "Version: ${{ steps.rom.outputs.version }}"
+            echo "Region: $REGION"
+            echo "Published: ${{ steps.rom.outputs.published }}"
+            echo "Source: ${{ steps.rom.outputs.url }}"
+            echo "Source MD5: ${{ steps.rom.outputs.md5 }}"
+            echo
+            echo "All available payload partition images are included."
+            echo "Images larger than 2 GiB are split into numbered parts."
+            echo
+            echo "Reconstruct split images:"
+            echo 'cat super.img.part* > super.img'
+            echo
+            echo "Verify:"
+            echo "sha256sum -c SHA256SUMS"
+            echo
+            echo "This is not a flashable ROM package."
+          } > ROM-INFO.md
+
+          cd ..
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rom.outputs.version }}
+          name: Pipa Recovery ROM - ${{ steps.rom.outputs.version }}
+          body: |
+            Xiaomi Pad 6 (pipa) Recovery ROM partition dump.
+
+            Version: ${{ steps.rom.outputs.version }}
+            Region: ${{ env.REGION }}
+            Published: ${{ steps.rom.outputs.published }}
+
+            All available payload images are included.
+            Large images are split into numbered parts.
+
+            See ROM-INFO.md and SHA256SUMS.
+          files: release/images/*
+          fail_on_unmatched_files: true
+          make_latest: true
+          generate_release_notes: false
