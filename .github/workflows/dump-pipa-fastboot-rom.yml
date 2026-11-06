@@ -90,10 +90,11 @@ jobs:
 
               if [ "$magic" = "ed26ff3a" ]; then
                 echo "super.img is already Android sparse; preserving it."
-                cp --reflink=auto "$source" "$destination"
+                mv "$source" "$destination"
               else
                 echo "super.img is raw; converting it to Android sparse format."
                 img2simg "$source" "$destination"
+                rm -f "$source"
               fi
 
               output_magic=$(od -An -tx4 -N4 "$destination" | tr -d ' \n')
@@ -108,6 +109,7 @@ jobs:
 
           COUNT=$(find release/images -maxdepth 1 -type f -name '*.img' | wc -l)
           test "$COUNT" -gt 0
+          test -s release/images/super.img
           echo "Prepared $COUNT individual partition images."
           ls -lh release/images
           df -h .
@@ -162,7 +164,7 @@ jobs:
           } > ROM-INFO.md
 
           cd ..
-          sha256sum fastboot-rom.sha256 > release/SOURCE_ARCHIVE_SHA256.txt
+          cp fastboot-rom.sha256 release/SOURCE_ARCHIVE_SHA256.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
