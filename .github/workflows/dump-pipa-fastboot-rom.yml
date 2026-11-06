@@ -143,7 +143,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          find release/images -maxdepth 1 -type f -name '*.img' -print0 |
+          find release/images -type f -name '*.img' -print0 |
           while IFS= read -r -d '' file; do
             size=$(stat -c '%s' "$file")
             if [ "$size" -gt 2147483648 ]; then
@@ -209,6 +209,7 @@ jobs:
 
             Read ROM-INFO.md and verify files using SHA256SUMS.
           files: |
+            release/images/**/*
             release/images/*
             release/ROM-INFO.md
             release/SHA256SUMS
