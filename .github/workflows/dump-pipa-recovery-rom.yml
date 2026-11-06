@@ -1,0 +1,194 @@
+name: Dump Xiaomi Pad 6 Recovery ROM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pipa-rom-dump
+  cancel-in-progress: false
+
+env:
+  ROM_VERSION: OS2.0.14.0.UMZINXM
+  ROM_URL: https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS2.0.14.0.UMZINXM/pipa_in_global-ota_full-OS2.0.14.0.UMZINXM-user-14.0-00783b8e7f.zip
+  DUMPER_COMMIT: 2f0a964b8b77c6244e3e12735f85539c938f9c97
+
+jobs:
+  dump:
+    name: Download, extract and publish partition images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /usr/local/share/chromium || true
+          df -h
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install aria2 and Git
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 git
+          aria2c --version
+
+      - name: Download ROM with aria2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rom"
+          cd "$RUNNER_TEMP/rom"
+          aria2c \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=1M \
+            --file-allocation=none \
+            --continue=true \
+            --max-tries=10 \
+            --retry-wait=5 \
+            --timeout=60 \
+            --connect-timeout=30 \
+            --allow-overwrite=true \
+            --auto-file-renaming=false \
+            --console-log-level=notice \
+            --summary-interval=30 \
+            --out=rom.zip \
+            "$ROM_URL"
+          test -s rom.zip
+          ls -lh rom.zip
+
+      - name: Extract payload.bin from ROM ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import zipfile
+
+          archive = os.path.join(os.environ["RUNNER_TEMP"], "rom", "rom.zip")
+          output = os.path.join(os.environ["RUNNER_TEMP"], "payload.bin")
+
+          with zipfile.ZipFile(archive) as zf:
+              matches = [name for name in zf.namelist()
+                         if name.rsplit("/", 1)[-1] == "payload.bin"]
+              if len(matches) != 1:
+                  raise SystemExit(f"Expected exactly one payload.bin, found: {matches}")
+              info = zf.getinfo(matches[0])
+              print(f"Extracting {matches[0]} ({info.file_size:,} bytes)")
+              with zf.open(info) as src, open(output, "wb") as dst:
+                  while True:
+                      chunk = src.read(8 * 1024 * 1024)
+                      if not chunk:
+                          break
+                      dst.write(chunk)
+
+          if not os.path.isfile(output) or os.path.getsize(output) == 0:
+              raise SystemExit("payload.bin extraction failed")
+          print(f"payload.bin size: {os.path.getsize(output):,} bytes")
+          PY
+          rm -f "$RUNNER_TEMP/rom/rom.zip"
+          rmdir "$RUNNER_TEMP/rom" || true
+          df -h
+
+      - name: Get native Python payload dumper
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/vm03/payload_dumper.git "$RUNNER_TEMP/payload_dumper"
+          git -C "$RUNNER_TEMP/payload_dumper" checkout "$DUMPER_COMMIT"
+          python -m venv "$RUNNER_TEMP/dumper-venv"
+          "$RUNNER_TEMP/dumper-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/dumper-venv/bin/python" -m pip install -r "$RUNNER_TEMP/payload_dumper/requirements.txt"
+
+      - name: Dump all partition images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pipa-partitions"
+          "$RUNNER_TEMP/dumper-venv/bin/python" \
+            "$RUNNER_TEMP/payload_dumper/payload_dumper.py" \
+            "$RUNNER_TEMP/payload.bin" \
+            --out "$RUNNER_TEMP/pipa-partitions"
+          rm -f "$RUNNER_TEMP/payload.bin"
+          echo "Extracted partition files:"
+          find "$RUNNER_TEMP/pipa-partitions" -type f -printf '%p (%s bytes)\n' | sort
+          test -n "$(find "$RUNNER_TEMP/pipa-partitions" -type f -name '*.img' -print -quit)"
+          df -h
+
+      - name: Prepare release assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          image_count=0
+
+          while IFS= read -r -d '' image; do
+            image_count=$((image_count + 1))
+            filename="$(basename "$image")"
+            destination="release-assets/$filename"
+            size="$(stat -c '%s' "$image")"
+
+            if (( size > 1900 * 1024 * 1024 )); then
+              echo "Splitting large image: $filename ($size bytes)"
+              split -b 1900M -d -a 3 "$image" "$destination.part"
+              rm -f "$image"
+            else
+              mv "$image" "$destination"
+            fi
+          done < <(find "$RUNNER_TEMP/pipa-partitions" -type f -name '*.img' -print0)
+
+          if (( image_count == 0 )); then
+            echo "No .img partition files were produced."
+            exit 1
+          fi
+
+          cat > release-assets/ROM-INFO.md <<EOF
+          # Xiaomi Pad 6 (pipa) Recovery ROM
+
+          - ROM version: $ROM_VERSION
+          - Package: pipa_in_global-ota_full-OS2.0.14.0.UMZINXM-user-14.0-00783b8e7f.zip
+          - Source: $ROM_URL
+          - Extractor: vm03/payload_dumper
+          - Dumper commit: $DUMPER_COMMIT
+
+          Large partition images are split into numbered parts to fit GitHub Release asset limits.
+          Join each set of parts in numeric order to reconstruct its original image.
+          EOF
+
+          (
+            cd release-assets
+            sha256sum * > SHA256SUMS
+          )
+
+          echo "Partition images processed: $image_count"
+          du -sh release-assets
+          ls -lh release-assets
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.ROM_VERSION }}
+          name: Xiaomi Pad 6 Recovery ROM - ${{ env.ROM_VERSION }}
+          body: |
+            Extracted partition images from the Xiaomi Pad 6 (pipa) Recovery ROM.
+
+            ROM version: ${{ env.ROM_VERSION }}
+
+            Large images are split into numbered parts. Download all parts for an image and concatenate them in numeric order to reconstruct the original image.
+
+            See ROM-INFO.md and SHA256SUMS for details and checksums.
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          make_latest: true
