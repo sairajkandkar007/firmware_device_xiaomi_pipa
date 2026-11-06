@@ -85,7 +85,6 @@ jobs:
           set -euo pipefail
 
           aria2c \
-            --input-file=/dev/null \
             --max-connection-per-server=16 \
             --split=16 \
             --min-split-size=1M \
