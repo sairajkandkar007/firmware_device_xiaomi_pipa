@@ -36,10 +36,10 @@ jobs:
           set -euo pipefail
           git clone https://github.com/soe1hom-arch/lucky-arch.git
           cd lucky-arch
-          go build -trimpath -ldflags="-s -w" -o ../lucky-arch .
+          go build -trimpath -ldflags="-s -w" -o ../lucky-arch-bin .
           cd ..
-          ./lucky-arch -version || true
-          test -x ./lucky-arch
+          ./lucky-arch-bin -version
+          test -x ./lucky-arch-bin
 
       - name: Download fastboot ROM
         run: |
@@ -127,7 +127,7 @@ jobs:
           set -euo pipefail
 
           mkdir -p release/images/super_partitions
-          ./lucky-arch -v -o release/images/super_partitions release/images/super.img
+          ./lucky-arch-bin -v -o release/images/super_partitions release/images/super.img
 
           LOGICAL_COUNT=$(find release/images/super_partitions -maxdepth 1 -type f -name '*.img' | wc -l)
           if [ "$LOGICAL_COUNT" -eq 0 ]; then
@@ -209,11 +209,7 @@ jobs:
 
             Read ROM-INFO.md and verify files using SHA256SUMS.
           files: |
-            release/images/**/*
-            release/images/*
-            release/ROM-INFO.md
-            release/SHA256SUMS
-            release/SOURCE_ARCHIVE_SHA256.txt
+            release/**/*
           fail_on_unmatched_files: true
           make_latest: false
           generate_release_notes: false
