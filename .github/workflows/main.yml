@@ -34,7 +34,9 @@ jobs:
 
     env:
       REGION: ${{ inputs.region }}
-      TRACKER: https://raw.githubusercontent.com/XiaomiFirmwareUpdater/miui-updates-tracker/master/rss/pipa.xml
+      ROM_VERSION: OS2.0.14.0.UMZINXM
+      ROM_URL: https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS2.0.14.0.UMZINXM/pipa_in_global-ota_full-OS2.0.14.0.UMZINXM-user-14.0-00783b8e7f.zip
+      ROM_MD5: 00783b8e7ff2110e9bb7c79375906ee4
       DUMPER_COMMIT: 2f0a964b8b77c6244e3e12735f85539c938f9c97
       SPLIT_SIZE: 1900M
 
@@ -66,86 +68,17 @@ jobs:
 
           aria2c --version
 
-      - name: Find latest stable recovery ROM
+      - name: Set fixed ROM details
         id: rom
         run: |
-          python3 - <<'PY'
-          import os
-          import re
-          import html
-          import urllib.request
-          import xml.etree.ElementTree as ET
-          from email.utils import parsedate_to_datetime
-
-          url = os.environ["TRACKER"]
-          region = os.environ["REGION"]
-
-          request = urllib.request.Request(
-              url,
-              headers={"User-Agent": "Pipa-ROM-Dumper"}
-          )
-
-          with urllib.request.urlopen(request, timeout=60) as response:
-              root = ET.fromstring(response.read())
-
-          matches = []
-
-          for item in root.findall("./channel/item"):
-              title = item.findtext("title", "")
-              description = html.unescape(
-                  item.findtext("description", "")
-              )
-              download = item.findtext("link", "")
-              published = item.findtext("pubDate", "")
-
-              if f"Recovery update for Xiaomi Pad 6 {region}" not in title:
-                  continue
-
-              if "New Stable Recovery update available" not in description:
-                  continue
-
-              version = re.search(
-                  r"MIUI\s+(.+?)\s+Recovery update",
-                  title
-              )
-
-              md5 = re.search(
-                  r"MD5:</b>\s*([a-fA-F0-9]{32})",
-                  description
-              )
-
-              if not version or not md5:
-                  continue
-
-              if not download.startswith("https://"):
-                  continue
-
-              date = parsedate_to_datetime(published)
-
-              matches.append((
-                  date,
-                  version.group(1).strip(),
-                  download,
-                  md5.group(1).lower()
-              ))
-
-          if not matches:
-              raise SystemExit("No stable recovery ROM found.")
-
-          matches.sort(reverse=True)
-
-          date, version, download, md5 = matches[0]
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"version={version}\n")
-              f.write(f"url={download}\n")
-              f.write(f"md5={md5}\n")
-              f.write(f"published={date.isoformat()}\n")
-
-          print("ROM:", version)
-          print("Download:", download)
-          print("Published:", date.isoformat())
-          PY
+          {
+            echo "version=$ROM_VERSION"
+            echo "url=$ROM_URL"
+            echo "md5=$ROM_MD5"
+            echo "published=User-supplied direct ROM URL"
+          } >> "$GITHUB_OUTPUT"
+          echo "Selected ROM: $ROM_VERSION"
+          echo "Source: $ROM_URL"
 
       - name: Download ROM using aria2
         run: |
@@ -315,7 +248,7 @@ jobs:
             Large images are split into numbered parts.
 
             See ROM-INFO.md and SHA256SUMS.
-          files: release/images/*
+          files: release/**/*
           fail_on_unmatched_files: true
           make_latest: true
           generate_release_notes: false
