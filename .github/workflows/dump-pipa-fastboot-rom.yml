@@ -1,0 +1,189 @@
+name: Pipa Fastboot ROM Downloader and Dumper
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pipa-fastboot-rom-dumper
+  cancel-in-progress: false
+
+jobs:
+  dump:
+    name: Download and prepare Pipa fastboot images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      ROM_VERSION: OS2.0.14.0.UMZINXM
+      ROM_URL: https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS2.0.14.0.UMZINXM/pipa_in_global_images_OS2.0.14.0.UMZINXM_20260414.0000.00_14.0_in_2a8218ddf5.tgz
+      SPLIT_SIZE: 1900M
+
+    steps:
+      - name: Install download and Android sparse-image tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y aria2 android-sdk-libsparse-utils
+
+          aria2c --version
+          img2simg --help || true
+
+      - name: Download fastboot ROM
+        run: |
+          set -euo pipefail
+
+          aria2c \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=1M \
+            --file-allocation=none \
+            --continue=true \
+            --max-tries=10 \
+            --retry-wait=5 \
+            --connect-timeout=30 \
+            --timeout=120 \
+            --summary-interval=10 \
+            --check-integrity=true \
+            --out=fastboot-rom.tgz \
+            "$ROM_URL"
+
+          test -s fastboot-rom.tgz
+          gzip -t fastboot-rom.tgz
+          sha256sum fastboot-rom.tgz | tee fastboot-rom.sha256
+
+      - name: Extract fastboot archive
+        run: |
+          set -euo pipefail
+
+          mkdir -p extracted release/images
+          tar -xzf fastboot-rom.tgz -C extracted --no-same-owner
+          rm -f fastboot-rom.tgz
+
+          IMAGE_COUNT=$(find extracted -type f -iname '*.img' | wc -l)
+          if [ "$IMAGE_COUNT" -eq 0 ]; then
+            echo "No .img partition files found in the fastboot archive."
+            find extracted -maxdepth 4 -type f | head -200
+            exit 1
+          fi
+
+          echo "Found $IMAGE_COUNT image files."
+          df -h .
+
+      - name: Copy individual partition images and sparse super.img
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r -d '' source; do
+            name=$(basename "$source")
+            destination="release/images/$name"
+
+            if [ -e "$destination" ]; then
+              echo "Duplicate image filename in archive: $name"
+              exit 1
+            fi
+
+            if [ "$name" = "super.img" ]; then
+              magic=$(od -An -tx4 -N4 "$source" | tr -d ' \n')
+
+              if [ "$magic" = "ed26ff3a" ]; then
+                echo "super.img is already Android sparse; preserving it."
+                cp --reflink=auto "$source" "$destination"
+              else
+                echo "super.img is raw; converting it to Android sparse format."
+                img2simg "$source" "$destination"
+              fi
+
+              output_magic=$(od -An -tx4 -N4 "$destination" | tr -d ' \n')
+              if [ "$output_magic" != "ed26ff3a" ]; then
+                echo "super.img conversion/validation failed."
+                exit 1
+              fi
+            else
+              cp --reflink=auto "$source" "$destination"
+            fi
+          done < <(find extracted -type f -iname '*.img' -print0)
+
+          COUNT=$(find release/images -maxdepth 1 -type f -name '*.img' | wc -l)
+          test "$COUNT" -gt 0
+          echo "Prepared $COUNT individual partition images."
+          ls -lh release/images
+          df -h .
+
+      - name: Split assets exceeding GitHub release size limit
+        run: |
+          set -euo pipefail
+
+          find release/images -maxdepth 1 -type f -name '*.img' -print0 |
+          while IFS= read -r -d '' file; do
+            size=$(stat -c '%s' "$file")
+            if [ "$size" -gt 2147483648 ]; then
+              echo "Splitting oversized image: $file"
+              split --bytes="$SPLIT_SIZE" --numeric-suffixes=1 --suffix-length=3 "$file" "$file.part"
+              rm -f "$file"
+            fi
+          done
+
+          find release/images -type f -print0 |
+          while IFS= read -r -d '' file; do
+            size=$(stat -c '%s' "$file")
+            if [ "$size" -gt 2147483648 ]; then
+              echo "Asset exceeds 2 GiB: $file"
+              exit 1
+            fi
+          done
+
+      - name: Generate checksums and ROM information
+        run: |
+          set -euo pipefail
+
+          cd release
+          find images -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+
+          {
+            echo "# Xiaomi Pad 6 (pipa) Fastboot ROM"
+            echo
+            echo "Version: $ROM_VERSION"
+            echo "Archive: $ROM_URL"
+            echo
+            echo "Individual partition image files are provided under images/."
+            echo "super.img is provided in Android sparse-image format."
+            echo "If an image exceeds the GitHub asset size limit, it is split into numbered .partNNN files."
+            echo
+            echo "Reconstruct a split image with:"
+            echo 'cat partition.img.part* > partition.img'
+            echo
+            echo "Verify image files with:"
+            echo "sha256sum -c SHA256SUMS"
+            echo
+            echo "This release contains partition images, not a flash-all package."
+          } > ROM-INFO.md
+
+          cd ..
+          sha256sum fastboot-rom.sha256 > release/SOURCE_ARCHIVE_SHA256.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fastboot-${{ env.ROM_VERSION }}
+          name: Pipa Fastboot ROM - ${{ env.ROM_VERSION }}
+          body: |
+            Xiaomi Pad 6 (pipa) fastboot ROM partition images.
+
+            Version: ${{ env.ROM_VERSION }}
+
+            Each partition image is uploaded as an individual release asset.
+            super.img is converted to Android sparse format when the source is raw.
+            Oversized images are split into numbered parts.
+
+            Read ROM-INFO.md and verify files using SHA256SUMS.
+          files: |
+            release/images/*
+            release/ROM-INFO.md
+            release/SHA256SUMS
+            release/SOURCE_ARCHIVE_SHA256.txt
+          fail_on_unmatched_files: true
+          make_latest: false
+          generate_release_notes: false
