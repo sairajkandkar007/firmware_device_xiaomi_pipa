@@ -26,10 +26,20 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y aria2 android-sdk-libsparse-utils
+          sudo apt-get install -y aria2 android-sdk-libsparse-utils golang-go
 
           aria2c --version
           img2simg --help || true
+
+      - name: Build super image unpacker
+        run: |
+          set -euo pipefail
+          git clone https://github.com/soe1hom-arch/lucky-arch.git
+          cd lucky-arch
+          go build -trimpath -ldflags="-s -w" -o ../lucky-arch .
+          cd ..
+          ./lucky-arch -version || true
+          test -x ./lucky-arch
 
       - name: Download fastboot ROM
         run: |
@@ -72,46 +82,61 @@ jobs:
           echo "Found $IMAGE_COUNT image files."
           df -h .
 
-      - name: Copy individual partition images and sparse super.img
+      - name: Stage standalone images and prepare sparse super.img
         run: |
           set -euo pipefail
 
+          SUPER_SOURCE=$(find extracted -type f -iname 'super.img' -print -quit)
+          if [ -z "$SUPER_SOURCE" ]; then
+            echo "super.img was not found in the fastboot archive."
+            exit 1
+          fi
+
           while IFS= read -r -d '' source; do
             name=$(basename "$source")
+            [ "$name" = "super.img" ] && continue
             destination="release/images/$name"
 
             if [ -e "$destination" ]; then
               echo "Duplicate image filename in archive: $name"
               exit 1
             fi
-
-            if [ "$name" = "super.img" ]; then
-              magic=$(od -An -tx4 -N4 "$source" | tr -d ' \n')
-
-              if [ "$magic" = "ed26ff3a" ]; then
-                echo "super.img is already Android sparse; preserving it."
-                mv "$source" "$destination"
-              else
-                echo "super.img is raw; converting it to Android sparse format."
-                img2simg "$source" "$destination"
-                rm -f "$source"
-              fi
-
-              output_magic=$(od -An -tx4 -N4 "$destination" | tr -d ' \n')
-              if [ "$output_magic" != "ed26ff3a" ]; then
-                echo "super.img conversion/validation failed."
-                exit 1
-              fi
-            else
-              cp --reflink=auto "$source" "$destination"
-            fi
+            mv "$source" "$destination"
           done < <(find extracted -type f -iname '*.img' -print0)
 
-          COUNT=$(find release/images -maxdepth 1 -type f -name '*.img' | wc -l)
-          test "$COUNT" -gt 0
+          magic=$(od -An -tx4 -N4 "$SUPER_SOURCE" | tr -d ' \n')
+          if [ "$magic" = "ed26ff3a" ]; then
+            echo "super.img is already Android sparse."
+            mv "$SUPER_SOURCE" release/images/super.img
+          else
+            echo "Converting raw super.img to Android sparse format."
+            img2simg "$SUPER_SOURCE" release/images/super.img
+            rm -f "$SUPER_SOURCE"
+          fi
+
+          output_magic=$(od -An -tx4 -N4 release/images/super.img | tr -d ' \n')
+          test "$output_magic" = "ed26ff3a"
           test -s release/images/super.img
-          echo "Prepared $COUNT individual partition images."
+
+          echo "Standalone fastboot images staged; sparse super.img ready."
           ls -lh release/images
+          df -h .
+
+      - name: Unpack super.img into logical partition images
+        run: |
+          set -euo pipefail
+
+          mkdir -p release/images/super_partitions
+          ./lucky-arch -v -o release/images/super_partitions release/images/super.img
+
+          LOGICAL_COUNT=$(find release/images/super_partitions -maxdepth 1 -type f -name '*.img' | wc -l)
+          if [ "$LOGICAL_COUNT" -eq 0 ]; then
+            echo "No logical partition images were extracted from super.img."
+            exit 1
+          fi
+
+          echo "Extracted $LOGICAL_COUNT logical partitions from super.img:"
+          ls -lh release/images/super_partitions
           df -h .
 
       - name: Split assets exceeding GitHub release size limit
@@ -150,8 +175,9 @@ jobs:
             echo "Version: $ROM_VERSION"
             echo "Archive: $ROM_URL"
             echo
-            echo "Individual partition image files are provided under images/."
-            echo "super.img is provided in Android sparse-image format."
+            echo "Standalone fastboot partition images are provided under images/."
+            echo "super.img is retained in Android sparse-image format."
+            echo "Logical partitions contained inside super.img are unpacked under images/super_partitions/."
             echo "If an image exceeds the GitHub asset size limit, it is split into numbered .partNNN files."
             echo
             echo "Reconstruct a split image with:"
@@ -176,8 +202,9 @@ jobs:
 
             Version: ${{ env.ROM_VERSION }}
 
-            Each partition image is uploaded as an individual release asset.
-            super.img is converted to Android sparse format when the source is raw.
+            Standalone fastboot partition images are uploaded individually.
+            super.img is retained in Android sparse format and unpacked into its logical partition images.
+            Logical partitions are under images/super_partitions/.
             Oversized images are split into numbered parts.
 
             Read ROM-INFO.md and verify files using SHA256SUMS.
